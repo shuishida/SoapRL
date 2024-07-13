@@ -59,7 +59,7 @@ bash run_training.sh <env-name> <algo-name>
   - CartPole-v1
   - LunarLander-v2
   - Corridor environments
-    - corridor-l<length> (e.g. `corridor-l4`, `corridor-l10`, `corridor-l20`)
+    - corridor-l<length> (e.g. `corridor-l3`, `corridor-l10`, `corridor-l20`)
   - Atari environments
     - BeamRiderNoFrameskip-v4
     - BreakoutNoFrameskip-v4
