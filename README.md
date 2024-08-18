@@ -1,7 +1,9 @@
 # SOAP-RL: Sequential Option Advantage Propagation for Reinforcement Learning in POMDP Environments
 Shu Ishida, João F. Henriques (Visual Geometry Group, University of Oxford)
 
-This repository contains the code for the paper "SOAP-RL: Sequential Option Advantage Propagation for Reinforcement Learning in POMDP Environments".
+Paper: [SOAP-RL: Sequential Option Advantage Propagation for Reinforcement Learning in POMDP Environments](https://arxiv.org/abs/2407.18913)
+
+This repository contains the code for the paper ["SOAP-RL: Sequential Option Advantage Propagation for Reinforcement Learning in POMDP Environments"](https://arxiv.org/abs/2407.18913).
 
 This work compares ways of extending Reinforcement Learning algorithms to POMDPs with options. 
 Options function as memory that allows the agent to retain historical information beyond the policy's context window. 
@@ -16,12 +18,24 @@ With this approach, the option policy is only conditional on the history of the 
 
 Evaluated against competing baselines, SOAP exhibited the most robust performance, correctly discovering options for POMDP corridor environments, as well as on standard benchmarks including Atari and MuJoCo, outperforming PPOEM, as well as LSTM and Option-Critic baselines. 
 
+## Citation
+If you find the code or paper useful, please consider citing:
+
+```
+@article{ishida2024soap,
+  title={SOAP-RL: Sequential Option Advantage Propagation for Reinforcement Learning in POMDP Environments},
+  author={Ishida, Shu and Henriques, Jo{\~a}o F},
+  journal={arXiv preprint arXiv:2407.18913},
+  year={2024}
+} 
+```
+
 ## Setup
 
 Create a conda environment with Python 3.8 or above and install the required packages:
 
 ```bash
-git clone https://github.com/shuishida/soap_rl.git
+git clone https://github.com/shuishida/SoapRL.git
 
 pip install stable-baselines3[extra]==2.2.1 rl_zoo3==2.2.1 wandb einops
 ```
