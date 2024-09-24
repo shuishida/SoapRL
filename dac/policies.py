@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.utils.model_utils import create_mlp
-from ppoc.distributions import DistributionModule
+from dac.distributions import DistributionModule
 from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, NatureCNN, CombinedExtractor
@@ -190,10 +190,7 @@ class PPOActorCriticPolicy(ActorCriticPolicy):
 
         values = self.value_net(latent_vf)
 
-        log_option_prob, switch_probs = self.compute_transitions(latent_obs)
-        switch_probs = th.where(repeat(episode_starts.bool(), "b -> b o", o=self.option_dim), th.ones_like(switch_probs), switch_probs)
-        switch_prob = (switch_probs * prev_option).sum(dim=-1, keepdim=True)
-        new_option_probs = (1 - switch_prob) * prev_option + switch_prob * log_option_prob.exp()
+        new_option_probs = self.compute_transitions(latent_obs, prev_option, episode_starts)
         with th.no_grad():
             new_option = F.gumbel_softmax((new_option_probs + 1e-8).log(), hard=True)
 
@@ -239,12 +236,16 @@ class PPOActorCriticPolicy(ActorCriticPolicy):
 
         return latent_pi, latent_vf, latent_trans
 
-    def compute_transitions(self, latent_obs: th.Tensor):
+    def compute_transitions(self, latent_obs: th.Tensor, prev_options: th.Tensor, episode_starts: th.Tensor):
         log_option_prob = self.option_policy(latent_obs)  # log pi(z|s): shape (B, O)
-        switch_prob = self.switch_prob(latent_obs)       # p(switch|s): shape (B, O)
-        return log_option_prob, switch_prob
+        switch_probs = self.switch_prob(latent_obs)       # p(switch|s): shape (B, O)
+        switch_probs = th.where(repeat(episode_starts.bool(), "b -> b o", o=self.option_dim), th.ones_like(switch_probs), switch_probs)
+        switch_prob = (switch_probs * prev_options).sum(dim=-1, keepdim=True)
+        new_option_probs = (1 - switch_prob) * prev_options + switch_prob * log_option_prob.exp()
+        return new_option_probs
 
-    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor, option: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
+    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor,
+                         option: th.Tensor, prev_option: th.Tensor, episode_starts: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -258,14 +259,17 @@ class PPOActorCriticPolicy(ActorCriticPolicy):
         values = self.value_net(latent_vf)
         distribution = self.action_dist(latent_pi, option)
         log_prob = distribution.log_prob(actions)
-        log_option_prob, switch_prob = self.compute_transitions(latent_obs)
+        new_option_probs = self.compute_transitions(latent_obs, prev_option, episode_starts)
+        log_option_probs = (new_option_probs + 1e-8).log()
+        log_option_prob = th.einsum("bo,bo->b", log_option_probs, option)
         entropy = distribution.entropy()
-        return values, log_prob, log_option_prob, switch_prob, entropy
+        option_entropy = -(new_option_probs * log_option_probs).sum(dim=-1)
+        return values, log_prob, log_option_prob, entropy, option_entropy
 
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
         raise NotImplementedError
 
-    def predict_values(self, obs: PyTorchObs, prev_options) -> th.Tensor:
+    def predict_values(self, obs: PyTorchObs, prev_options: th.Tensor, episode_starts: th.Tensor) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
 
@@ -275,11 +279,10 @@ class PPOActorCriticPolicy(ActorCriticPolicy):
         _, latent_vf, latent_obs = self.extract_latents(obs, compute_pi=False)
 
         values = self.value_net(latent_vf)
-        log_option_prob, switch_probs = self.compute_transitions(latent_obs)
+        new_option_probs = self.compute_transitions(latent_obs, prev_options, episode_starts)
+        log_option_probs = (new_option_probs + 1e-8).log()
         with th.no_grad():
-            switch_prob = (switch_probs * prev_options).sum(dim=-1, keepdim=True)
-            new_option_probs = (1 - switch_prob) * prev_options + switch_prob * log_option_prob.exp()
-            new_option = F.gumbel_softmax((new_option_probs + 1e-8).log(), hard=True)
+            new_option = F.gumbel_softmax(log_option_probs, hard=True)
         return values, new_option, new_option_probs
 
     def _predict(
@@ -295,7 +298,7 @@ class PPOActorCriticPolicy(ActorCriticPolicy):
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy
         """
-        actions, values, log_prob, new_option, new_option_probs = self(observation, prev_option=prev_option, episode_starts=episode_starts, deterministic=deterministic)
+        actions, values, log_prob, log_option_prob, switch_prob, new_option, new_option_probs = self(observation, prev_option=prev_option, episode_starts=episode_starts, deterministic=deterministic)
         return actions, new_option
 
     def predict(

@@ -5,7 +5,7 @@ from gymnasium import spaces
 import torch as th
 import numpy as np
 
-from ppoc.type_aliases import PPORolloutBufferSamples
+from dac.type_aliases import PPORolloutBufferSamples
 from stable_baselines3.common.buffers import BaseBuffer
 from stable_baselines3.common.type_aliases import GymObs
 from stable_baselines3.common.vec_env import VecNormalize
@@ -123,6 +123,14 @@ class PPORolloutBuffer(BaseBuffer):
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
         self.returns = self.advantages + th.einsum("teo,teo->te", self.values, self.options)
 
+        last_gae_lam = 0
+        for step in reversed(range(self.buffer_size)):
+            next_values = th.einsum("eo,eo->e", self.next_values[step], self.next_options_probs[step]) * (1.0 - self.terminals[step])   # (N,)
+            target_values = self.rewards[step] + self.gamma * next_values + self.gamma * self.gae_lambda * (1.0 - self.dones[step]) * last_gae_lam   # V_target (B, Z')
+            self.option_advantages[step] = last_gae_lam = target_values - th.einsum("eo,eo->e", self.values[step], self.option_probs[step])  # (B, Z)
+        # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
+        self.option_returns = self.option_advantages + th.einsum("teo,teo->te", self.values, self.option_probs)
+
     def add(
         self,
         obs: GymObs,
@@ -130,7 +138,7 @@ class PPORolloutBuffer(BaseBuffer):
         action: np.ndarray,
         reward: np.ndarray,
         episode_start: np.ndarray,
-        done: np.ndarray,
+        done: th.Tensor,
         terminal: th.Tensor,
         value: th.Tensor,
         log_prob: th.Tensor,
@@ -181,7 +189,7 @@ class PPORolloutBuffer(BaseBuffer):
         self.actions[self.pos] = th.tensor(action)
         self.rewards[self.pos] = th.tensor(reward)
         self.episode_starts[self.pos] = episode_start.cpu().clone().detach()
-        self.dones[self.pos] = th.tensor(done)
+        self.dones[self.pos] = done = done.cpu().clone().detach()
         self.terminals[self.pos] = terminal.cpu().clone().detach()
         self.values[self.pos] = value = value.cpu().clone().detach()
         self.log_probs[self.pos] = log_prob.cpu().clone().detach()
@@ -242,10 +250,13 @@ class PPORolloutBuffer(BaseBuffer):
             actions=select(self.actions),
             old_values=select(self.values),
             old_log_prob=select(self.log_probs),
-            returns=select(self.returns),
             advantages=select(self.advantages),
+            returns=select(self.returns),
+            option_advantages=select(self.option_advantages),
+            option_returns=select(self.option_returns),
             prev_option=select(self.prev_options),
             option=select(self.options),
+            option_prob=select(self.option_probs),
         )
 
     def to_device(self, array: th.Tensor, copy: bool = True) -> th.Tensor:

@@ -96,7 +96,8 @@ bash run_training.sh <env-name> <algo-name>
 - `<algo-name>`: Algorithm name
   - `soap`: SOAP-RL
   - `ppoem`: PPO-EM
-  - `ppo`: Proximal Policy Optimization
-  - `ppoc`: Proximal Policy Option Critic
+  - `ppo`: [Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
+  - `ppoc`: [Proximal Policy Option Critic](https://arxiv.org/abs/1712.00004)
+  - `dac`: [Double Actor-Critic](https://arxiv.org/abs/1904.12691)
   - `ppo-lstm`: PPO with LSTM
   - many other algorithms from stable-baselines3

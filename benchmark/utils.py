@@ -10,6 +10,7 @@ sys.path.insert(0, ".")
 from ppoc.ppo import PPOC
 from ppoem.ppo import PPOEM
 from soap.ppo import SOAP
+from dac.ppo import DAC
 
 
 ALGOS: Dict[str, Type[BaseAlgorithm]] = {
@@ -18,4 +19,5 @@ ALGOS: Dict[str, Type[BaseAlgorithm]] = {
     "ppoc": PPOC,
     "ppoem": PPOEM,
     "soap": SOAP,
+    "dac": DAC,
 }

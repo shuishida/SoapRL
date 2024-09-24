@@ -15,5 +15,8 @@ class PPORolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
+    option_advantages: th.Tensor
+    option_returns: th.Tensor
     prev_option: th.Tensor
     option: th.Tensor
+    option_prob: th.Tensor

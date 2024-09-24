@@ -8,38 +8,30 @@ import torch as th
 import torch.nn.functional as F
 from gymnasium import spaces
 
-from ppoc.buffers import PPORolloutBuffer
-from ppoc.policies import PPOActorCriticPolicy, PPOActorCriticCnnPolicy, PPOMultiInputActorCriticPolicy
-from ppoc.type_aliases import PPORolloutBufferSamples
+from dac.buffers import PPORolloutBuffer
+from dac.policies import PPOActorCriticPolicy, PPOActorCriticCnnPolicy, PPOMultiInputActorCriticPolicy
+from dac.type_aliases import PPORolloutBufferSamples
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 
-SelfPPO = TypeVar("SelfPPO", bound="PPO")
+SelfDAC = TypeVar("SelfDAC", bound="DAC")
 
 
 class EarlyStopping(Exception):
     """Custom exception to trigger early stopping of training."""
     pass
 
+
 """
-Implements the option-critic algorithm
+Implements the Double Actor-Critic algorithm
 """
 
 
-class PPOC(OnPolicyAlgorithm):
+class DAC(OnPolicyAlgorithm):
     """
-    Proximal Policy Optimization algorithm (PPO) (clip version)
-
-    Paper: https://arxiv.org/abs/1707.06347
-    Code: This implementation borrows code from OpenAI Spinning Up (https://github.com/openai/spinningup/)
-    https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail and
-    Stable Baselines (PPO2 from https://github.com/hill-a/stable-baselines)
-
-    Introduction to PPO: https://spinningup.openai.com/en/latest/algorithms/ppo.html
-
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
     :param learning_rate: The learning rate, it can be a function
@@ -152,7 +144,6 @@ class PPOC(OnPolicyAlgorithm):
             ),
         )
 
-        self.beta_reg = beta_reg
         self.option_ent_coef = option_ent_coef
 
         # Sanity check, otherwise it will lead to noisy gradient and NaN
@@ -312,8 +303,10 @@ class PPOC(OnPolicyAlgorithm):
             next_option_probs = None
             next_obs = obs_as_tensor(deepcopy(new_obs), self.device)
             terminals = th.zeros(len(dones), dtype=th.float, device=self.device)
+            np_dones = dones
+            dones = th.tensor(np_dones, dtype=th.float32, device=self.device)
             if sum(dones):
-                for idx in np.flatnonzero(dones):
+                for idx in np.flatnonzero(np_dones):
                     if "terminal_observation" in infos[idx]:
                         terminal_obs, _ = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])
                         if isinstance(next_obs, dict):
@@ -325,7 +318,7 @@ class PPOC(OnPolicyAlgorithm):
                         terminals[idx] = 1.0
                 with th.no_grad():
                     # Compute value for the last timestep
-                    next_values, next_options, next_option_probs = self.policy.predict_values(next_obs, new_options)
+                    next_values, next_options, next_option_probs = self.policy.predict_values(next_obs, new_options, dones)
                     next_values = next_values * (1.0 - terminals).unsqueeze(-1)
 
             rollout_buffer.add(curr_obs, next_obs, actions, rewards, episode_starts, dones, terminals,
@@ -338,10 +331,11 @@ class PPOC(OnPolicyAlgorithm):
         if next_values is None:
             with th.no_grad():
                 # Compute value for the last timestep
-                next_values, next_options, next_option_probs = self.policy.predict_values(next_obs, new_options)
+                next_values, next_options, next_option_probs = self.policy.predict_values(next_obs, new_options, dones)
                 next_values = next_values * (1.0 - terminals).unsqueeze(-1)
 
-        rollout_buffer.compute_returns_and_advantage(last_values=next_values, last_options=next_options, last_options_probs=next_option_probs,
+        rollout_buffer.compute_returns_and_advantage(last_values=next_values, last_options=next_options,
+                                                     last_options_probs=next_option_probs,
                                                      save_dir=self.logger.dir + "/rollouts")
 
         callback.update_locals(locals())
@@ -394,8 +388,9 @@ class PPOC(OnPolicyAlgorithm):
         except EarlyStopping:
             pass
 
-        explained_var = explained_variance(th.einsum("teo,teo->te", self.rollout_buffer.values, self.rollout_buffer.options).numpy().flatten(),
-                                           self.rollout_buffer.returns.numpy().flatten())
+        explained_var = explained_variance(
+            th.einsum("teo,teo->te", self.rollout_buffer.values, self.rollout_buffer.options).numpy().flatten(),
+            self.rollout_buffer.returns.numpy().flatten())
 
         for key, value in loss_infos.items():
             self.logger.record(f"train_loss/{key}", np.mean(value))
@@ -421,51 +416,28 @@ class PPOC(OnPolicyAlgorithm):
             # Convert discrete action from float to long
             actions = rollout_data.actions.long().flatten()
 
-        option = rollout_data.option
-        values, log_prob, log_option_prob, switch_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions, option)
+        values, log_prob, log_option_prob, entropy, option_entropy \
+            = self.policy.evaluate_actions(rollout_data.observations, actions,
+                                           rollout_data.option, rollout_data.prev_option, rollout_data.episode_starts)
 
-        # Normalize advantage
-        advantages = rollout_data.advantages
-        # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-        if self.normalize_advantage and len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        policy_loss, value_loss = self._calc_loss(rollout_data.advantages, log_prob, rollout_data.old_log_prob,
+                                                  values, rollout_data.old_values, rollout_data.returns,
+                                                  rollout_data.option, clip_range, clip_range_vf)
 
-        # ratio between old and new policy, should be one at the first iteration
-        ratio = th.exp(log_prob - rollout_data.old_log_prob)
-        # clipped surrogate loss
-        policy_loss_1 = advantages * ratio
-        policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-        policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-        clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float())
-
-        v = th.einsum("bo,bo->b", values, option)
-        old_v = th.einsum("bo,bo->b", rollout_data.old_values, option)
-        if self.clip_range_vf is None:
-            # No clipping
-            values_pred = v
-        else:
-            # Clip the difference between old and new value
-            # NOTE: this depends on the reward scaling
-            values_pred = old_v + th.clamp(v - old_v, -clip_range_vf, clip_range_vf)
-        # Value loss using the TD(gae_lambda) target
-        value_loss = F.mse_loss(rollout_data.returns, values_pred)
-
+        old_log_option_prob = th.einsum("bo,bo->b", (rollout_data.option_prob + 1e-8).log(), rollout_data.option)
+        option_policy_loss, option_value_loss = self._calc_loss(rollout_data.option_advantages, log_option_prob, old_log_option_prob,
+                                                                values, rollout_data.old_values, rollout_data.option_returns,
+                                                                rollout_data.option_prob, clip_range, clip_range_vf)
         # Entropy loss favor exploration
         if entropy is None:
             # Approximate entropy when no analytical form
             entropy_loss = -th.mean(-log_prob)
         else:
             entropy_loss = -th.mean(entropy)
+        option_ent_loss = -th.mean(option_entropy)
 
-        option_loss = - th.einsum("bo,bo,b->b", log_option_prob, option, advantages).mean()
-        option_ent_loss = (log_option_prob.exp() * log_option_prob).sum(-1).mean()
-
-        switch_adv = th.einsum("bo,bo->b", values, rollout_data.prev_option - log_option_prob.exp()) + self.beta_reg
-        switch_loss = th.einsum("bo,bo->b", switch_prob, rollout_data.prev_option) * (1 - rollout_data.episode_starts) * switch_adv
-        switch_loss = switch_loss.mean()
-
-        loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + switch_loss + option_loss + self.option_ent_coef * option_ent_loss
+        loss = (policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                + option_policy_loss + self.option_ent_coef * option_ent_loss + self.vf_coef * option_value_loss)
 
         # Calculate approximate form of reverse KL Divergence for early stopping
         # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -481,19 +453,47 @@ class PPOC(OnPolicyAlgorithm):
             raise EarlyStopping()
 
         return loss, \
-            dict(policy_loss=policy_loss, value_loss=value_loss, entropy_loss=entropy_loss), \
-            dict(approx_kl=approx_kl_div, clip_fraction=clip_fraction, returns=rollout_data.returns.mean()), \
+            dict(policy_loss=policy_loss, value_loss=value_loss, entropy_loss=entropy_loss,
+                 option_policy_loss=option_policy_loss, option_value_loss=option_value_loss, option_ent_loss=option_ent_loss), \
+            dict(approx_kl=approx_kl_div, returns=rollout_data.returns.mean()), \
             dict(log_prob=log_prob)
 
+    def _calc_loss(self, advantages, log_prob, old_log_prob, values, old_values, returns, option_weights, clip_range, clip_range_vf) -> \
+    Tuple[th.Tensor, th.Tensor]:
+        # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+        if self.normalize_advantage and len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # ratio between old and new policy, should be one at the first iteration
+        ratio = th.exp(log_prob - old_log_prob)
+        # clipped surrogate loss
+        policy_loss_1 = advantages * ratio
+        policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+        policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+        v = th.einsum("bo,bo->b", values, option_weights)
+        old_v = th.einsum("bo,bo->b", old_values, option_weights)
+        if self.clip_range_vf is None:
+            # No clipping
+            values_pred = v
+        else:
+            # Clip the difference between old and new value
+            # NOTE: this depends on the reward scaling
+            values_pred = old_v + th.clamp(v - old_v, -clip_range_vf, clip_range_vf)
+        # Value loss using the TD(gae_lambda) target
+        value_loss = F.mse_loss(returns, values_pred)
+
+        return policy_loss, value_loss
+
     def learn(
-        self: SelfPPO,
+        self: SelfDAC,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
-        tb_log_name: str = "PPOC",
+        tb_log_name: str = "DAC",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfPPO:
+    ) -> SelfDAC:
 
         return super().learn(
             total_timesteps=total_timesteps,
